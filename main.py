@@ -1,23 +1,30 @@
-import pymongo
 import geopandas as gpd
-import json
-import redis
-import requests
+import pandas as pd
+from scipy.stats import trim_mean
+from databases import *
+from astral import LocationInfo
+from astral.sun import sun
+from scipy import stats
+import folium
 
 def prepare_data(stations_path, boundary_path):
 
     stations = gpd.read_file(stations_path)
     boundaries = gpd.read_file(boundary_path)
 
-    #WAZNE: stacje sa w ukladzie 2180 ale metadane z geojsona nie zostaly zapisane w bazie wiec trzeba pamietac
-    if stations.crs != boundaries.crs:
-        boundaries = boundaries.to_crs(stations.crs)
+    #wszystko do wgs84 bo astral inaczej nie zadziala - potem zmienic do wizualizacji na 2180
+    stations = stations.to_crs(epsg=4326)
+    boundaries = boundaries.to_crs(epsg=4326)
+    # if stations.crs != boundaries.crs:
+    #     boundaries = boundaries.to_crs(stations.crs)
+
+    counties_json = json.loads(boundaries.to_json(default=str))['features']
 
     boundaries_subset = boundaries[['geometry', 'name', 'id']].rename(
         columns={'name': 'nazwa_powiatu', 'id': 'id_powiatu'})
 
-    joined = gpd.sjoin(stations, boundaries_subset, how="left", predicate="within")
-    stations_json = json.loads(joined.to_json(default=str))["features"]
+    joined = gpd.sjoin(stations, boundaries_subset, how='left', predicate='within')
+    stations_json = json.loads(joined.to_json(default=str))['features']
 
     for feature in stations_json:
         props = feature['properties']
@@ -28,92 +35,105 @@ def prepare_data(stations_path, boundary_path):
         props.pop('id_powiatu', None)
         props.pop('index_right', None)
 
-    return stations_json
+    return stations_json, counties_json
 
-class MongoManager:
-    def __init__(self, host="mongodb://localhost:27017/", database="projekt2"):
-       try:
-           self.client = pymongo.MongoClient()
-           self.db = self.client[database]
-           print('Connected to MongoDB.')
-       except Exception as e:
-           print(f"Failed to connect to MongoDB: {e}.")
+def prepare_csv(csv_path):
+    df = pd.read_csv(csv_path, sep=';', names=['station_id', 'm_type', 'date', 'values'])
 
-    def insert_data(self, stations):
-        if not stations:
-            print("No data to insert.")
-            return
+    df['date'] = pd.to_datetime(df['date'])
+    df['date_day'] = df['date'].dt.date.astype(str)
+    df['date_time'] = df['date'].dt.strftime('%H:%M')
 
-        try:
-            collection = self.db.stacje
-            collection.delete_many({})
+    docs = []
 
-            collection.insert_many(stations)
-            print("Data inserted successfully.")
+    for (s_id, m_t, d_day), group in df.groupby(['station_id', 'm_type', 'date_day']):
+        measurements = []
+        for _, row in group.iterrows():
+            measurements.append({
+                'time': str(row['date_time']),
+                'value': float(row['values'])
+            })
 
-            return list(collection.find())
+        doc = {
+            'station_id': int(s_id),
+            'm_type': str(m_t),
+            'date': str(d_day),
+            'values': measurements
+        }
 
-        except Exception as e:
-            print(f"Failed to insert data: {e}.")
-            return None
-
-class RedisManager:
-    def __init__(self, host="localhost", port=6379):
-        try:
-            self.r = redis.Redis(host=host, port=port, decode_responses=True)
-            self.r.config_set("stop-writes-on-bgsave-error", "no")
-            print("Connected to Redis.")
-        except Exception as e:
-            print(f"Failed to connect to Redis: {e}.")
-
-    def push_tasks(self, data):
-        for stat in data:
-            props = stat.get("properties")
-            task = {
-                "ifcid": props.get("ifcid"),
-                "url": props.get("gmlidentif")}
-
-            self.r.lpush("queue", json.dumps(task))
-        print(f"Pushed {len(data)} tasks to Redis queue.")
-
-    def get_task(self):
-        task = self.r.lpop("queue")
-        return json.loads(task) if task else None
+        docs.append(doc)
+    return docs
 
 
-def process_task(redis_mgr):
-    task = redis_mgr.get_task()
-    if task is None:
-        print("No tasks found.")
-        return False
+class AnalysisManager:
+    def __init__(self, mongo_mgr, redis_mgr):
+        self.mongo = mongo_mgr
+        self.redis = redis_mgr
 
-    url = task.get("url")
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, timeout=10, headers=headers)
-        if response.status_code == 200:
-            print("Data fetched successfully")
-        else:
-            print(f"Request failed for {url} with status: {response.status_code}")
+    def prepare_dataframe(self):
+        measurements = list(self.mongo.db.stacje.find({}))
 
-    except Exception as e:
-        print(f"Error fetching data: {e}")
+        if not measurements:
+            print('Analysis // No data found.')
+            return pd.DataFrame()
 
-    return True
+        daytime = []
+        for doc in measurements:
+            s_id = str(doc['station_id'])
+            date = str(doc['date'])
+
+            position = self.redis.db.geopos('station_points', s_id)
+            if not position or position[0] is None:
+                continue
+
+            ## ASTRAl ##
+            lon, lat = position[0]
+            loc = LocationInfo(latitude=lat, longitude=lon)
+            s = sun(loc.observer, date=pd.to_datetime(date))
+            sunrise = s['sunrise'].strftime('%H:%M')
+            sunset = s['sunset'].strftime('%H:%M')
+
+            for m in doc['values']:
+                m_time = m['time']
+
+                is_day = sunrise <= m_time <= sunset
+
+                daytime.append({
+                    'station_id': int(s_id),
+                    'date': date,
+                    'time': m_time,
+                    'is_day': True if is_day else False,
+                    'value': m['value']
+                })
+
+        return pd.DataFrame(daytime)
+
+
+def main(stations_path, measurement_path, boundary_path, refresh_data=True):
+    m = MongoManager()
+    r = RedisManager()
+
+    mongo_empty = m.db.stacje.count_documents({}) == 0 or m.db.powiaty.count_documents({}) == 0
+    redis_empty = not r.db.exists('station_points')
+
+    if mongo_empty or redis_empty:
+        measurement_data = prepare_csv(measurement_path)
+        station_data, county_data = prepare_data(stations_path, boundary_path)
+
+        if mongo_empty:
+            m.insert_data(measurement_data, county_data)
+
+        if redis_empty:
+            r.insert_data(station_data)
+
+    a = AnalysisManager(m,r)
+    df = a.prepare_dataframe()
+    print(df)
 
 if __name__ == "__main__":
-    # 1 geojson, 2 shp powiaty / wojewodztwa
-    stations = prepare_data(r"Dane/effacility.geojson", r"Dane/powiaty.shp")
+    main(r'Dane/effacility.geojson', r'Dane/B00300S_2025_09.csv', r'Dane/powiaty.shp', False)
 
-    m = MongoManager()
-    db_data = m.insert_data(stations)
 
-    r = RedisManager()
-    r.push_tasks(db_data)
 
-    while process_task(r):
-        pass
 
-    """
-    Nie dzialaja linki z geojsona nie wiem co z tym zrobic przykro mi
-    """
+
