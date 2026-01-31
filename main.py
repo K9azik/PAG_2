@@ -1,11 +1,8 @@
 import geopandas as gpd
 import pandas as pd
-from scipy.stats import trim_mean
 from databases import *
 from astral import LocationInfo
 from astral.sun import sun
-from scipy import stats
-import folium
 
 def prepare_data(stations_path, boundary_path):
 
@@ -64,7 +61,6 @@ def prepare_csv(csv_path):
         docs.append(doc)
     return docs
 
-
 class AnalysisManager:
     def __init__(self, mongo_mgr, redis_mgr):
         self.mongo = mongo_mgr
@@ -109,7 +105,7 @@ class AnalysisManager:
         return pd.DataFrame(daytime)
 
 
-def main(stations_path, measurement_path, boundary_path, refresh_data=True):
+def main(stations_path, measurement_path, boundary_path):
     m = MongoManager()
     r = RedisManager()
 
@@ -131,7 +127,7 @@ def main(stations_path, measurement_path, boundary_path, refresh_data=True):
     print(df)
 
 if __name__ == "__main__":
-    main(r'Dane/effacility.geojson', r'Dane/B00300S_2025_09.csv', r'Dane/powiaty.shp', False)
+    main(r'Dane/effacility.geojson', r'Dane/B00300S_2025_09.csv', r'Dane/powiaty.shp')
 
 
 
