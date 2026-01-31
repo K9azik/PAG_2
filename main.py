@@ -3,6 +3,8 @@ import pandas as pd
 from databases import *
 from astral import LocationInfo
 from astral.sun import sun
+import folium
+from mapka import map_creator
 
 def prepare_data(stations_path, boundary_path):
 
@@ -104,7 +106,6 @@ class AnalysisManager:
 
         return pd.DataFrame(daytime)
 
-
 def main(stations_path, measurement_path, boundary_path):
     m = MongoManager()
     r = RedisManager()
@@ -125,6 +126,8 @@ def main(stations_path, measurement_path, boundary_path):
     a = AnalysisManager(m,r)
     df = a.prepare_dataframe()
     print(df)
+    map_creator(a)
+
 
 if __name__ == "__main__":
     main(r'Dane/effacility.geojson', r'Dane/B00300S_2025_09.csv', r'Dane/powiaty.shp')
