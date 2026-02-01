@@ -67,16 +67,54 @@ class RedisManager:
         except Exception as e:
             print(f'Redis // Failed to insert data: {e}.')
 
+def get_counties_with_station_count(mongo_mgr, redis_mgr):
+    station_ids_with_data = set(mongo_mgr.db.stacje.distinct('station_id'))
+    
+    counties = list(mongo_mgr.db.powiaty.find({}, {'properties.name': 1, 'properties.id': 1, '_id': 0}))
+    
+    county_id_to_name = {}
+    for county in counties:
+        if 'properties' in county:
+            county_name = county['properties'].get('name')
+            county_id = county['properties'].get('id')
+            if county_name and county_id:
+                county_id_to_name[county_id] = county_name
+    
+    county_counts = {name: 0 for name in county_id_to_name.values()}
+    
+    for key in redis_mgr.db.keys('station:*'):
+        station_json = redis_mgr.db.get(key)
+        if station_json:
+            station = json.loads(station_json)
+            s_id = station.get('properties', {}).get('ifcid')
+            county_id = station.get('properties', {}).get('powiatinfo', {}).get('id')
+            
+            if s_id in station_ids_with_data and county_id and county_id in county_id_to_name:
+                county_name = county_id_to_name[county_id]
+                county_counts[county_name] += 1
+    
+    return county_counts
 
-def get_county_data(mongo_mgr, redis_mgr, county_name, start_date, end_date):
-    """Wyciąga dane stacji z powiatu w przedziale dat. Zwraca dict z 'stations' i 'measurements'."""
+
+def get_date_range(mongo_mgr):
+    pipeline = [
+        {'$group': {
+            '_id': None,
+            'min_date': {'$min': '$date'},
+            'max_date': {'$max': '$date'}
+        }}
+    ]
+    result = list(mongo_mgr.db.stacje.aggregate(pipeline))
+    if result:
+        return result[0]['min_date'], result[0]['max_date']
+    return None, None
+
+
+def analyze_county_day_night(mongo_mgr, redis_mgr, county_name, start_date, end_date):
     county = mongo_mgr.db.powiaty.find_one({'properties.name': county_name})
-    if not county:
-        return None
-    
     county_id = county['properties']['id']
+
     stations, station_ids = [], []
-    
     for key in redis_mgr.db.keys('station:*'):
         station = json.loads(redis_mgr.db.get(key))
         if station['properties'].get('powiatinfo', {}).get('id') == county_id:
@@ -88,26 +126,19 @@ def get_county_data(mongo_mgr, redis_mgr, county_name, start_date, end_date):
         'date': {'$gte': start_date, '$lte': end_date}
     }))
     
-    return {'county': county, 'stations': stations, 'measurements': measurements}
-
-
-def analyze_county_day_night(mongo_mgr, redis_mgr, county_name, start_date, end_date):
-    data = get_county_data(mongo_mgr, redis_mgr, county_name, start_date, end_date)
-    if not data:
-        return None
-    
     results = {
-        'county': data['county']['properties'],
+        'county': county['properties'],
+        'county_geometry': county['geometry'],
         'date_range': {'start': start_date, 'end': end_date},
         'stations': []
     }
-    
-    for station in data['stations']:
+
+    for station in stations:
         station_id = station['properties']['ifcid']
         coords = station['geometry']['coordinates']
         lon, lat = coords[0], coords[1]
         
-        station_measurements = [m for m in data['measurements'] if m['station_id'] == station_id]
+        station_measurements = [m for m in measurements if m['station_id'] == station_id]
         
         if not station_measurements:
             continue
